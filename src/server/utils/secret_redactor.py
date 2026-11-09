@@ -116,12 +116,14 @@ def get_redactor() -> SecretRedactor:
     return _instance
 
 
-def scrub_outbound_text(text: str) -> str:
+def scrub_outbound_text(text: str, vault_secrets: dict[str, str] | None = None) -> str:
     """Credential shapes, and the values of this deployment's own secrets, out
-    of text that leaves for a third party (Sentry, the team's Slack)."""
+    of text that leaves for a third party (Sentry, LangSmith, the team's
+    Slack). ``vault_secrets`` adds the values of the user the text is about
+    (``get_vault_secrets_for_redaction``), which no pattern recognizes."""
     from src.server.utils.error_sanitization import sanitize_error_text
 
-    return get_redactor().redact(sanitize_error_text(text))
+    return get_redactor().redact(sanitize_error_text(text), vault_secrets=vault_secrets)
 
 
 async def get_vault_secrets_for_redaction(user_id: str) -> dict[str, str]:

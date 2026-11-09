@@ -38,8 +38,10 @@ logger = logging.getLogger(__name__)
 # Past the platform's own budget for posting to Slack, so a slow post that
 # lands is answered as accepted rather than given up on.
 _FORWARD_TIMEOUT_S = 45.0
-# The platform's limit on a note; scrubbing can lengthen one at the limit.
+# The platform's limits on a note and on an error's text; scrubbing can
+# lengthen text already at the limit.
 _NOTE_MAX = 4000
+_ERROR_MAX = 2000
 
 
 def reports_enabled() -> bool:
@@ -85,10 +87,26 @@ class PlatformReport(BaseModel):
     created_at: str = Field(default_factory=_now)
 
 
-def _scrub(text: Optional[str]) -> Optional[str]:
+class ScrubUnavailable(Exception):
+    """The user's vault could not be read, so their text cannot be cleared to
+    leave: the report is refused as unavailable, never sent unscrubbed."""
+
+
+async def user_vault(user_id: str) -> dict[str, str]:
+    """The values of the user's own secrets, to scrub from what they send."""
+    from src.server.utils.secret_redactor import get_vault_secrets_for_redaction
+
+    try:
+        return await get_vault_secrets_for_redaction(user_id)
+    except Exception as e:
+        logger.warning("Vault unreadable for user %s, report held: %s", user_id, e)
+        raise ScrubUnavailable from e
+
+
+def _scrub(text: Optional[str], vault: dict[str, str], limit: int = _NOTE_MAX) -> Optional[str]:
     from src.server.utils.secret_redactor import scrub_outbound_text
 
-    return scrub_outbound_text(text)[:_NOTE_MAX] if text else text
+    return scrub_outbound_text(text, vault)[:limit] if text else text
 
 
 async def _workspace_id(thread_id: str) -> Optional[str]:
@@ -114,8 +132,11 @@ async def _failed_run(thread_id: str, run_id: Optional[UUID]) -> Optional[dict[s
 async def build_report(report: ReportCreate, *, user_id: str) -> PlatformReport:
     """A report from the report dialog, as the platform takes it. The caller
     has checked that the user owns ``report.thread_id``. A failed turn's
-    report links its run's trace and Sentry issues."""
+    report links its run's trace and Sentry issues. Raises
+    ``ScrubUnavailable`` when the user's vault cannot be read."""
     from src.observability.sentry import sentry_issues_url
+
+    vault = await user_vault(user_id)
 
     thread_id = str(report.thread_id) if report.thread_id else None
     workspace_id = await _workspace_id(thread_id) if thread_id else None
@@ -137,8 +158,12 @@ async def build_report(report: ReportCreate, *, user_id: str) -> PlatformReport:
         run_id=run_id,
         turn_index=run.get("turn_index") if run else None,
         category=report.category,
-        user_note=_scrub(report.user_note),
-        error=error.model_copy(update={"message": _scrub(error.message)}) if error else None,
+        user_note=_scrub(report.user_note, vault),
+        error=error.model_copy(
+            update={"type": _scrub(error.type, vault, 200), "message": _scrub(error.message, vault, _ERROR_MAX)}
+        )
+        if error
+        else None,
         trace_url=await trace_url(run_id),
         sentry_url=sentry_issues_url(run_id),
     )
@@ -213,6 +238,10 @@ async def _post_thumbs(
     human_review: bool,
     client: Optional[ReportClient],
 ) -> PlatformResult:
+    try:
+        vault = await user_vault(rating.user_id)
+    except ScrubUnavailable:
+        return PlatformResult("unavailable")
     return await post_report(
         PlatformReport(
             report_id=report_id,
@@ -225,8 +254,9 @@ async def _post_thumbs(
             run_id=rating.run_id,
             turn_index=rating.turn_index,
             category=None if human_review else "feedback",
-            issue_categories=rating.issue_categories,
-            user_note=_scrub(rating.comment),
+            # Free text to the API, as the comment is.
+            issue_categories=[c for c in (_scrub(c, vault, 64) for c in rating.issue_categories) if c],
+            user_note=_scrub(rating.comment, vault),
             trace_url=await trace_url(rating.run_id) if human_review else None,
         )
     )
@@ -236,11 +266,15 @@ async def reply_to_thumbs_down(rating: ThumbsDown, note: str, *, note_id: str) -
     """Post a note under the rating's report. ``note_id`` is made by the
     client for the note and kept across its retries, so the note is posted
     once however often it is sent."""
+    try:
+        vault = await user_vault(rating.user_id)
+    except ScrubUnavailable:
+        return PlatformResult("unavailable")
     return await _post(
         f"/api/auth/reports/{rating.report_id}/replies",
         {
             "user_id": rating.user_id,
-            "note": _scrub(note),
+            "note": _scrub(note, vault),
             "reply_id": str(uuid5(_REPLY_NAMESPACE, f"{rating.report_id}:{note_id}")),
             "created_at": _now(),
         },
@@ -268,12 +302,7 @@ async def _withdraw(report_id: str, user_id: str) -> PlatformResult:
 
 
 async def post_report(report: PlatformReport) -> PlatformResult:
-    result = await _post("/api/auth/reports", report.model_dump(mode="json"), report.report_id)
-    if result.status == "not_found":
-        # Creating a report has nothing to find: the platform lacks the route.
-        logger.error("Platform at %s has no reports route", AUTH_SERVICE_URL)
-        return PlatformResult("unavailable")
-    return result
+    return await _post("/api/auth/reports", report.model_dump(mode="json"), report.report_id)
 
 
 async def _post(path: str, body: dict[str, Any], report_id: str) -> PlatformResult:
@@ -297,7 +326,13 @@ async def _post(path: str, body: dict[str, Any], report_id: str) -> PlatformResu
         duplicate = _body(resp).get("status") == "duplicate"
         return PlatformResult("duplicate" if duplicate else "accepted")
     if code == 404:
-        return PlatformResult("not_found")
+        detail = _body(resp).get("detail")
+        if isinstance(detail, dict) and detail.get("error") == "report_not_found":
+            return PlatformResult("not_found")
+        # Any other 404 is a platform without the route, and a withdrawal must
+        # not read it as a report already gone.
+        logger.error("Platform at %s has no route for %s", AUTH_SERVICE_URL, path)
+        return PlatformResult("unavailable")
     if code == 409:
         detail = _body(resp).get("detail")
         error = detail.get("error") if isinstance(detail, dict) else None

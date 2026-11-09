@@ -5,8 +5,13 @@ the OTel runtime, so the SDK's transport thread belongs to the worker.
 
 What leaves the process is kept to what triage needs. Stack frames go without
 their local variables, which hold prompts, messages and tool output. Request
-bodies, cookies and auth headers stay behind (``send_default_pii`` off), and
-exception text is scrubbed for credentials the way error frames are.
+bodies, cookies and auth headers stay behind (``send_default_pii`` off), a
+request's path goes only as its route's template, and no log line goes, even
+as a breadcrumb. Exception text is scrubbed for credential shapes the way
+error frames are, and on a failed turn also for the values of that user's
+own secrets, which no pattern knows; any other event (a route's 5xx) has no
+user to read them for. ``extra`` goes empty, and ``contexts`` keeps only the
+runtime, OS and trace, so text an integration adds later is not sent on.
 
 A failed turn never raises out of the request: the run executor turns it into
 an ``error`` frame and a terminal ledger write. So turns are captured
@@ -17,8 +22,10 @@ outage and reaches the user with hints, so it is not an issue here.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
+from contextvars import ContextVar
 from typing import Any, Optional
 from urllib.parse import quote
 
@@ -68,20 +75,42 @@ def init_sentry() -> None:
 
 
 _CRUMB_DATA_KEPT = frozenset({"method", "url", "status_code", "reason"})
+_CONTEXTS_KEPT = frozenset({"runtime", "os", "trace"})
+
+# The secrets of the user a failed turn's event is about, set around its
+# capture (``before_send`` runs inside it, in the same context). ``_WITHHELD``
+# when their vault could not be read: the event keeps its type and stack and
+# loses its text. Unset for any other event, which has no user to read for.
+_WITHHELD: dict[str, str] = {}
+# For an event whose text can quote the user's data, sent with none of it.
+_NO_TEXT: dict[str, str] = {}
+_event_vault: ContextVar[Optional[dict[str, str]]] = ContextVar("sentry_event_vault", default=None)
 
 
 def _before_send(event: dict[str, Any], hint: dict[str, Any]) -> Optional[dict[str, Any]]:
-    from src.server.utils.secret_redactor import scrub_outbound_text as _scrub
+    from src.server.utils.secret_redactor import scrub_outbound_text
 
     exc_info = hint.get("exc_info")
     if exc_info and _is_expected(exc_info[1]):
         return None
-    # The method and path are enough to find the route. Headers can carry the
-    # service token, whose name the SDK's scrubber does not know, and a query
-    # string a stream's token.
+    vault = _event_vault.get()
+    if vault is _WITHHELD or vault is _NO_TEXT:
+        reason = "the user's secrets could not be read" if vault is _WITHHELD else "it can quote the user's data"
+        def _scrub(_text: str) -> str:
+            return f"[withheld: {reason}]"
+    else:
+        def _scrub(text: str) -> str:
+            return scrub_outbound_text(text, vault)
+    # The method and the matched route are enough to find it. Headers can
+    # carry the service token, whose name the SDK's scrubber does not know, a
+    # query string a stream's token, and the path itself a credential (a file
+    # grant, a share code), so the path is sent only as its route's template.
     request = event.get("request")
     if isinstance(request, dict):
-        event["request"] = {k: request[k] for k in ("method", "url") if k in request}
+        kept = {"method": request["method"]} if "method" in request else {}
+        if (event.get("transaction_info") or {}).get("source") == "route":
+            kept["url"] = event.get("transaction")
+        event["request"] = kept
     for exc in (event.get("exception") or {}).get("values") or ():
         if isinstance(exc.get("value"), str):
             exc["value"] = _scrub(exc["value"])
@@ -101,14 +130,16 @@ def _before_send(event: dict[str, Any], hint: dict[str, Any]) -> Optional[dict[s
     logentry = event.get("logentry")
     if isinstance(logentry, dict) and isinstance(logentry.get("message"), str):
         logentry["message"] = _scrub(logentry["message"])
+    event.pop("extra", None)
+    contexts = event.get("contexts")
+    if isinstance(contexts, dict):
+        event["contexts"] = {k: v for k, v in contexts.items() if k in _CONTEXTS_KEPT}
     return event
 
 
 def _is_expected(exc: BaseException) -> bool:
     """Failures that are not this service's bug: the client went away, the
     request was refused on purpose, or a model provider failed."""
-    import asyncio
-
     from fastapi import HTTPException
 
     if isinstance(exc, asyncio.CancelledError):
@@ -122,7 +153,7 @@ def _is_expected(exc: BaseException) -> bool:
     return failure_kind(exc)["kind"] != "internal"
 
 
-def capture_turn_failure(
+async def capture_turn_failure(
     exc: BaseException,
     *,
     thread_id: str,
@@ -131,9 +162,43 @@ def capture_turn_failure(
     workspace_id: Optional[str],
 ) -> Optional[str]:
     """Send a failed turn's exception, tagged with the ids a report carries,
-    so a report's ``run_id`` finds its issue. Returns the event id."""
+    so a report's ``run_id`` finds its issue, and scrubbed of the user's
+    secrets, which a tool's error can quote. Returns the event id."""
     if not _enabled:
         return None
+    vault: dict[str, str] = {}
+    if user_id:
+        from src.server.utils.secret_redactor import get_vault_secrets_for_redaction
+
+        try:
+            # Bounded: the caller is finalizing the run, which must not wait
+            # on a best-effort report.
+            vault = await asyncio.wait_for(get_vault_secrets_for_redaction(user_id), timeout=5)
+        except Exception:
+            logger.warning("Vault unreadable for user %s; event text withheld", user_id)
+            vault = _WITHHELD
+    return _capture(exc, vault, user_id=user_id, thread_id=thread_id, run_id=run_id, workspace_id=workspace_id)
+
+
+def capture_finalize_failure(exc: BaseException, *, thread_id: str, run_id: str) -> Optional[str]:
+    """Send a failure to write a run's terminal state, which otherwise only
+    logs. A database error quotes the row it refused, which can be the user's
+    words, so the event keeps its type and stack and loses its text."""
+    if not _enabled:
+        return None
+    return _capture(exc, _NO_TEXT, user_id=None, thread_id=thread_id, run_id=run_id, workspace_id=None)
+
+
+def _capture(
+    exc: BaseException,
+    vault: dict[str, str],
+    *,
+    user_id: Optional[str],
+    thread_id: str,
+    run_id: Optional[str],
+    workspace_id: Optional[str],
+) -> Optional[str]:
+    token = _event_vault.set(vault)
     try:
         import sentry_sdk
 
@@ -149,6 +214,8 @@ def capture_turn_failure(
     except Exception:
         logger.warning("Sentry capture failed", exc_info=True)
         return None
+    finally:
+        _event_vault.reset(token)
 
 
 def sentry_issues_url(run_id: Optional[str]) -> Optional[str]:
