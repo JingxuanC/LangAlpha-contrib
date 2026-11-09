@@ -378,6 +378,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     isShared: threadIsShared,
     handleThumbUp,
     handleThumbDown,
+    handleThumbDownFollowUp,
     feedbackByTurn,
     reconnectIfStaleRun,
     isOwnRun,
@@ -1113,6 +1114,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
   // Identity-stable action bundles for the memoized message tree
   // (chatView/useMessageActionBundles).
   const { messageActions, subagentMessageActions } = useMessageActionBundles({
+    reportThreadId: currentThreadId && currentThreadId !== '__default__' ? currentThreadId : undefined,
     onOpenFile: handleOpenFileFromChat,
     onDownloadFile: handleDownloadFileFromChat,
     onPublishFile,
@@ -1140,6 +1142,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     onRejectToolCall: handleRejectToolCall,
     onThumbUp: handleThumbUp,
     onThumbDown: handleThumbDown,
+    onThumbDownFollowUp: handleThumbDownFollowUp,
     onWidgetSendPrompt: stableSendMessage,
     onEditMessage: stableEditMessage,
     onRegenerate: stableRegenerate,
@@ -1779,7 +1782,10 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                     )}
                     {/* A notice is not about the running turn, so it need not wait for it to end. */}
                     {messageError && (!isLoading || (typeof messageError === 'object' && messageError.kind === 'notice')) && (
-                      <ErrorBanner error={messageError} />
+                      <ErrorBanner
+                        error={messageError}
+                        reportThreadId={currentThreadId && currentThreadId !== '__default__' ? currentThreadId : undefined}
+                      />
                     )}
                     {workspaceRecord?.computer_id && (
                       <ChatRestoreOffer
